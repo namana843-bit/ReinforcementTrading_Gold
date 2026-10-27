@@ -44,11 +44,14 @@ class ForexTradingEnv(gym.Env):
         sl_options=None,
         tp_options=None,
         feature_columns = None,
-        pip_value: float = 0.0001,
-        spread_pips: float = 1.0,              # cost in pips per round-trip (approx)
+        asset_name: str = "XAUUSD",            # target instrument (Gold)
+        tick_size: float = 0.01,               # Gold tick size in price units (1 pip = 0.01)
+        pip_value: float | None = None,         # alias for tick_size (price per pip)
+        contract_size: float = 100.0,          # Gold contract size (oz per lot); 1 lot = 100 oz
+        lot_size: float | None = None,         # alias for contract_size
+        spread_pips: float = 30.0,             # Gold spread in pips (round-trip approx)
         commission_pips: float = 0.0,          # cost in pips per round-trip
-        max_slippage_pips: float = 0.0,        # random extra pips (0..max) applied on fills
-        lot_size: float = 100000.0,            # 1.0 lot = 100k units (for equity in $)
+        max_slippage_pips: float = 2.0,        # random extra pips (0..max) applied on fills
         reward_scale: float = 1.0,             # optional scaling of rewards
         unrealized_delta_weight: float = 0.02, # shaping weight on delta-unrealized while holding
         random_start: bool = True,
@@ -60,6 +63,8 @@ class ForexTradingEnv(gym.Env):
         hold_reward_weight: float = 0.005,   # tuned below
         open_penalty_pips: float = 0.5,      # NEW: penalty per open
         time_penalty_pips: float = 0.02,     # NEW: cost per bar in a trade
+        atr_col: str | None = None,          # if set, sl/tp options are ATR multiples (scale-agnostic)
+        idle_penalty_pips: float = 0.0,      # OPTIONAL: penalty per bar spent flat (breaks HOLD-collapse)
     ):
         super().__init__()
 
@@ -75,22 +80,35 @@ class ForexTradingEnv(gym.Env):
             raise ValueError("sl_options and tp_options must be provided (e.g. [15,20,30]).")
         self.sl_options = list(sl_options)
         self.tp_options = list(tp_options)
+        self.atr_col = None
+        if atr_col is not None:
+            if atr_col in self.df.columns:
+                self.atr_col = atr_col
+            else:
+                print(f"[Env] WARNING: atr_col '{atr_col}' not in df columns; using raw-pip SL/TP.")
 
         if self.n_steps <= window_size + 2:
             raise ValueError("Dataframe is too short for the given window_size.")
 
         self.window_size = int(window_size)
+        self.asset_name = str(asset_name)
+        if pip_value is None:
+            pip_value = tick_size
+        if lot_size is None:
+            lot_size = contract_size
+        self.tick_size = float(tick_size)
         self.pip_value = float(pip_value)
+        self.contract_size = float(contract_size)
+        self.lot_size = float(lot_size)
 
         # Friction
         self.spread_pips = float(spread_pips)
         self.commission_pips = float(commission_pips)
         self.max_slippage_pips = float(max_slippage_pips)
 
-        # Equity accounting (approx): for EURUSD 1 pip per 1 lot ≈ $10
+        # Equity accounting (approx): for XAUUSD 1 pip (0.01) per 1 lot (100 oz) ≈ $1
         # pip_value (price) * lot_size (units) ≈ $ per 1.0 price move.
         # 1 pip = pip_value price move, so $/pip ≈ pip_value * lot_size.
-        self.lot_size = float(lot_size)
         self.usd_per_pip = self.pip_value * self.lot_size
 
         # Reward handling
@@ -100,6 +118,7 @@ class ForexTradingEnv(gym.Env):
         self.hold_reward_weight = float(hold_reward_weight)
         self.open_penalty_pips = float(open_penalty_pips)
         self.time_penalty_pips = float(time_penalty_pips)
+        self.idle_penalty_pips = float(idle_penalty_pips)
 
         # Episode handling
         self.random_start = bool(random_start)
@@ -232,6 +251,13 @@ class ForexTradingEnv(gym.Env):
     def _open_position(self, direction: int, sl_pips: float, tp_pips: float):
         # Entry on current close + slippage; costs applied on close (round-trip model)
         close_price = float(self.df.loc[self.current_step, "Close"])
+
+        # If atr_col is set, sl/tp args are ATR multiples -> convert to pips
+        if self.atr_col is not None:
+            atr_now = float(self.df.loc[self.current_step, self.atr_col])
+            sl_pips = float(sl_pips) * atr_now / self.pip_value
+            tp_pips = float(tp_pips) * atr_now / self.pip_value
+
         slip_pips = self._sample_slippage_pips()
         slip_price = slip_pips * self.pip_value
 
@@ -389,7 +415,6 @@ class ForexTradingEnv(gym.Env):
         # 1) Apply action logic
         if act_type == "HOLD":
             pass
-
         elif act_type == "CLOSE":
             if self.position != 0:
                 # Close at current close (with slippage)
@@ -416,6 +441,10 @@ class ForexTradingEnv(gym.Env):
         realized_now = self._check_sl_tp_intrabar_and_maybe_close()
         if realized_now is not None:
             reward_pips += realized_now
+
+        # 2b) Idle penalty: bar spent flat (breaks the "never trade" collapse)
+        if self.position == 0:
+            reward_pips -= self.idle_penalty_pips
 
         # 3) If still open, apply reward shaping based on delta-unrealized pips
         # 3) If still open, apply reward shaping
@@ -480,3 +509,7 @@ class ForexTradingEnv(gym.Env):
             f"Step={self.current_step} | Equity=${self.equity_usd:,.2f} | "
             f"Pos={self.position} | Entry={self.entry_price} | SL={self.sl_price} | TP={self.tp_price}"
         )
+
+# Gold-focused alias (XAU/USD)
+GoldTradingEnv = ForexTradingEnv
+
