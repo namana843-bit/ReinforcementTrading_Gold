@@ -62,6 +62,10 @@ def main():
     parser.add_argument("--csv_path", type=str, default=os.environ.get("GOLD_CSV_PATH", "data/gold_data_10y.csv"))
     parser.add_argument("--model_path", type=str, default="model_gold_best")
     parser.add_argument("--results_dir", type=str, default="./results")
+    parser.add_argument("--risk_pct_per_trade", type=float, default=None,
+                        help="must mirror the training env: risk %% of equity per trade (None = fixed lot)")
+    parser.add_argument("--max_lot_units", type=float, default=None)
+    parser.add_argument("--max_dd_pct", type=float, default=None)
     args = parser.parse_args()
 
     os.makedirs(args.results_dir, exist_ok=True)
@@ -100,6 +104,9 @@ def main():
         asset_name="XAUUSD",
         atr_col="atr_14",
         idle_penalty_pips=1.0,
+        risk_pct_per_trade=args.risk_pct_per_trade,
+        max_lot_units=args.max_lot_units,
+        max_dd_pct=args.max_dd_pct,
     )
 
     vec_test_env = DummyVecEnv([lambda: test_env])

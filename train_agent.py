@@ -54,6 +54,15 @@ def main():
     parser.add_argument("--timesteps", type=int, default=200000)
     parser.add_argument("--results_dir", type=str, default="./results")
     parser.add_argument("--model_name", type=str, default="model_gold_best")
+    parser.add_argument("--risk_pct_per_trade", type=float, default=None,
+                        help="e.g. 0.02 => risk 2%% of current equity per trade (dynamic sizing). None = fixed lot_size.")
+    parser.add_argument("--max_lot_units", type=float, default=None, help="cap on dynamic size (oz)")
+    parser.add_argument("--drawdown_penalty_weight", type=float, default=0.0,
+                        help="reward penalty per 1%% intra-episode dd growth")
+    parser.add_argument("--final_dd_penalty_weight", type=float, default=0.0,
+                        help="extra reward penalty per 1%% of episode max dd at episode end")
+    parser.add_argument("--max_dd_pct", type=float, default=None,
+                        help="circuit breaker: stop OPENing once equity <= peak*(1-x), force-close")
     args = parser.parse_args()
 
     os.makedirs(args.results_dir, exist_ok=True)
@@ -79,9 +88,10 @@ def main():
     TP_OPTS = [1.5, 2.0, 3.0]   # ATR multiples
     WIN = 30
 
-    def make_train_env():
-        return ForexTradingEnv(
-            df=train_df,
+    def _make_env(df, **kw):
+        """Shared env factory so train/train-eval/test-eval always share identical trading rules."""
+        base = dict(
+            df=df,
             window_size=WIN,
             sl_options=SL_OPTS,
             tp_options=TP_OPTS,
@@ -89,9 +99,6 @@ def main():
             commission_pips=0.0,
             max_slippage_pips=2.0,
             lot_size=20.0,
-            random_start=True,
-            min_episode_steps=1000,
-            episode_max_steps=2000,
             feature_columns=feature_cols,
             hold_reward_weight=0.0,
             open_penalty_pips=0.0,
@@ -100,51 +107,23 @@ def main():
             asset_name="XAUUSD",
             atr_col="atr_14",
             idle_penalty_pips=1.0,
+            risk_pct_per_trade=args.risk_pct_per_trade,
+            max_lot_units=args.max_lot_units,
+            drawdown_penalty_weight=args.drawdown_penalty_weight,
+            final_dd_penalty_weight=args.final_dd_penalty_weight,
+            max_dd_pct=args.max_dd_pct,
         )
+        base.update(kw)
+        return ForexTradingEnv(**base)
+
+    def make_train_env():
+        return _make_env(train_df, random_start=True, min_episode_steps=1000, episode_max_steps=2000)
 
     def make_train_eval_env():
-        return ForexTradingEnv(
-            df=train_df,
-            window_size=WIN,
-            sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
-            spread_pips=30.0,
-            commission_pips=0.0,
-            max_slippage_pips=2.0,
-            lot_size=20.0,
-            random_start=False,
-            episode_max_steps=None,
-            feature_columns=feature_cols,
-            hold_reward_weight=0.0,
-            open_penalty_pips=0.0,
-            time_penalty_pips=0.0,
-            unrealized_delta_weight=0.0,
-            asset_name="XAUUSD",
-            atr_col="atr_14",
-            idle_penalty_pips=1.0,
-        )
+        return _make_env(train_df, random_start=False, episode_max_steps=None)
 
     def make_test_eval_env():
-        return ForexTradingEnv(
-            df=test_df,
-            window_size=WIN,
-            sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
-            spread_pips=30.0,
-            commission_pips=0.0,
-            max_slippage_pips=2.0,
-            lot_size=20.0,
-            random_start=False,
-            episode_max_steps=None,
-            feature_columns=feature_cols,
-            hold_reward_weight=0.0,
-            open_penalty_pips=0.0,
-            time_penalty_pips=0.0,
-            unrealized_delta_weight=0.0,
-            asset_name="XAUUSD",
-            atr_col="atr_14",
-            idle_penalty_pips=1.0,
-        )
+        return _make_env(test_df, random_start=False, episode_max_steps=None)
 
     train_vec_env = DummyVecEnv([make_train_env])
     train_eval_env = DummyVecEnv([make_train_eval_env])

@@ -65,6 +65,13 @@ class ForexTradingEnv(gym.Env):
         time_penalty_pips: float = 0.02,     # NEW: cost per bar in a trade
         atr_col: str | None = None,          # if set, sl/tp options are ATR multiples (scale-agnostic)
         idle_penalty_pips: float = 0.0,      # OPTIONAL: penalty per bar spent flat (breaks HOLD-collapse)
+        # ---- Drawdown-optimization knobs (all default to the legacy fixed-lot behavior) ----
+        risk_pct_per_trade: float | None = None,  # e.g. 0.02 => risk 2% of current equity per SL distance
+        max_lot_units: float | None = None,       # cap on dynamic position size (oz)
+        min_lot_units: float = 1.0,               # floor on dynamic position size (oz)
+        drawdown_penalty_weight: float = 0.0,     # reward penalty per 1% equity-dd growth (while in dd)
+        final_dd_penalty_weight: float = 0.0,     # reward penalty per 1% of final total dd at episode end
+        max_dd_pct: float | None = None,          # circuit breaker: stop OPENing once equity <= peak*(1-x)
     ):
         super().__init__()
 
@@ -119,6 +126,14 @@ class ForexTradingEnv(gym.Env):
         self.open_penalty_pips = float(open_penalty_pips)
         self.time_penalty_pips = float(time_penalty_pips)
         self.idle_penalty_pips = float(idle_penalty_pips)
+
+        # Drawdown-optimization knobs
+        self.risk_pct_per_trade = risk_pct_per_trade
+        self.max_lot_units = max_lot_units
+        self.min_lot_units = float(min_lot_units)
+        self.drawdown_penalty_weight = float(drawdown_penalty_weight)
+        self.final_dd_penalty_weight = float(final_dd_penalty_weight)
+        self.max_dd_pct = max_dd_pct
 
         # Episode handling
         self.random_start = bool(random_start)
@@ -179,6 +194,13 @@ class ForexTradingEnv(gym.Env):
         # Accounting
         self.initial_equity_usd = 10000.0
         self.equity_usd = self.initial_equity_usd
+        self.peak_equity_usd = self.initial_equity_usd
+        self.prev_drawdown_pct = 0.0
+        self.drawdown_breached = False
+        self.episode_max_dd_pct = 0.0
+
+        # Per-position sizing (fixed-lot fallback = self.lot_size)
+        self.pos_lot_units = float(self.lot_size)
 
         # Logging
         self.equity_curve = []
@@ -258,6 +280,18 @@ class ForexTradingEnv(gym.Env):
             sl_pips = float(sl_pips) * atr_now / self.pip_value
             tp_pips = float(tp_pips) * atr_now / self.pip_value
 
+        # Risk-% sizing: choose lot so that hitting SL loses risk_pct of CURRENT equity.
+        # Dollars at risk per oz = sl_pips * pip_value; units = equity*risk% / that.
+        if self.risk_pct_per_trade is not None:
+            dollars_at_risk_per_oz = max(sl_pips * self.pip_value, 1e-9)
+            units = (self.equity_usd * self.risk_pct_per_trade) / dollars_at_risk_per_oz
+            units = max(units, self.min_lot_units)
+            if self.max_lot_units is not None:
+                units = min(units, float(self.max_lot_units))
+            self.pos_lot_units = float(units)
+        else:
+            self.pos_lot_units = float(self.lot_size)
+
         slip_pips = self._sample_slippage_pips()
         slip_price = slip_pips * self.pip_value
 
@@ -284,7 +318,8 @@ class ForexTradingEnv(gym.Env):
             "position": self.position,
             "entry_price": self.entry_price,
             "sl_price": self.sl_price,
-            "tp_price": self.tp_price
+            "tp_price": self.tp_price,
+            "lot_units": float(self.pos_lot_units),
         }
 
     def _close_position(self, reason: str, exit_price: float):
@@ -299,8 +334,10 @@ class ForexTradingEnv(gym.Env):
         cost_pips = self._cost_pips_round_trip()
         net_pips = realized_pips - cost_pips
 
-        # Update equity in USD
-        self.equity_usd += net_pips * self.usd_per_pip
+        # Update equity in USD (per-position sizing)
+        pos_usd_per_pip = self.pip_value * self.pos_lot_units
+        pnl_usd = net_pips * pos_usd_per_pip
+        self.equity_usd += pnl_usd
 
         trade_info = {
             "event": "CLOSE",
@@ -312,6 +349,8 @@ class ForexTradingEnv(gym.Env):
             "realized_pips": float(realized_pips),
             "cost_pips": float(cost_pips),
             "net_pips": float(net_pips),
+            "lot_units": float(self.pos_lot_units),
+            "pnl_usd": float(pnl_usd),
             "equity_usd": float(self.equity_usd),
             "time_in_trade": int(self.time_in_trade),
         }
@@ -425,7 +464,7 @@ class ForexTradingEnv(gym.Env):
                 reward_pips += self._close_position("MANUAL_CLOSE", exit_price)
 
         elif act_type == "OPEN":
-            if self.position == 0:
+            if self.position == 0 and not self.drawdown_breached:
                 self._open_position(direction=direction, sl_pips=sl_pips, tp_pips=tp_pips)
                 # penalty for opening a trade to discourage overtrading
                 reward_pips -= self.open_penalty_pips
@@ -441,6 +480,24 @@ class ForexTradingEnv(gym.Env):
         realized_now = self._check_sl_tp_intrabar_and_maybe_close()
         if realized_now is not None:
             reward_pips += realized_now
+
+        # 2c) Drawdown tracking, DD-penalty shaping, and circuit breaker
+        if self.equity_usd > self.peak_equity_usd:
+            self.peak_equity_usd = float(self.equity_usd)
+        dd_now = max(1.0 - self.equity_usd / self.peak_equity_usd, 0.0) if self.peak_equity_usd > 0 else 0.0
+        self.episode_max_dd_pct = max(self.episode_max_dd_pct, dd_now)
+        if self.drawdown_penalty_weight != 0.0:
+            dd_growth = max(dd_now - self.prev_drawdown_pct, 0.0)
+            reward_pips -= self.drawdown_penalty_weight * 100.0 * dd_growth
+        if self.max_dd_pct is not None and not self.drawdown_breached and dd_now > self.max_dd_pct:
+            self.drawdown_breached = True
+            if self.position != 0:
+                close_price = float(self.df.loc[self.current_step, "Close"])
+                slip_pips = self._sample_slippage_pips()
+                slip_price = slip_pips * self.pip_value
+                exit_price = close_price - slip_price if self.position == 1 else close_price + slip_price
+                reward_pips += self._close_position("MAX_DD_CIRCUIT_BREAKER", exit_price)
+        self.prev_drawdown_pct = dd_now
 
         # 2b) Idle penalty: bar spent flat (breaks the "never trade" collapse)
         if self.position == 0:
@@ -487,6 +544,8 @@ class ForexTradingEnv(gym.Env):
         obs = self._get_observation()
 
         # 8) Final reward scaling
+        if (self.terminated or self.truncated) and self.final_dd_penalty_weight != 0.0:
+            reward_pips -= self.final_dd_penalty_weight * 100.0 * self.episode_max_dd_pct
         reward = float(reward_pips) * self.reward_scale
 
         # 9) Info
@@ -495,6 +554,10 @@ class ForexTradingEnv(gym.Env):
             "position": int(self.position),
             "time_in_trade": int(self.time_in_trade),
             "reward_pips": float(reward_pips),
+            "drawdown_pct": float(dd_now),
+            "episode_max_dd_pct": float(self.episode_max_dd_pct),
+            "drawdown_breached": bool(self.drawdown_breached),
+            "peak_equity_usd": float(self.peak_equity_usd),
             "last_trade_info": self.last_trade_info
         })
 

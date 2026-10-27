@@ -103,4 +103,22 @@ In-sample eval of the same agent: $10,000 → $173,320. Artifacts: `results/equi
 
 Honesty notes: (1) the test window coincides with the exceptional 2025–26 gold rally ($2,700→$5,500), so a long-skewed RL agent is expected to shine — treat +424% as regime-dependent; (2) action probabilities are still near-uniform after 50k steps (PPO entropy stays close to ln(20)); the edge comes from argmax ordering, not sharp confidence — a longer/`reward_scale`d run would sharpen it.
 
+## Run #3 — drawdown optimization (risk-% sizing + DD shaping + circuit breaker)
+
+Run #2's +424% came with an 83.2% MDD because fixed 0.2-lot sizing risks 4–8% of equity per SL (daily ATR $20–40 ⇒ 1.0–2.0×ATR stops are $400–800 a loss). Env additions (backward compatible, off by default in `trading_env.py`): `risk_pct_per_trade`, `max_lot_units`/`min_lot_units`, `drawdown_penalty_weight`, `final_dd_penalty_weight`, `max_dd_pct` circuit breaker (force-close `MAX_DD_CIRCUIT_BREAKER`, then no OPENs while breached). `train_agent.py`/`test_agent.py` now expose `--risk_pct_per_trade/--max_lot_units/--drawdown_penalty_weight/--final_dd_penalty_weight/--max_dd_pct` and share one env factory so train/eval rules always match.
+
+Held-out results (same 77-trade action sequence for the old agent; only sizing changed):
+
+| Config | Final eq | Return | MDD | Sharpe | Ret/MDD |
+|---|---|---|---|---|---|
+| Run #2 fixed lot | $52,409 | +424.1% | 83.2% | 0.644 | 5.1 |
+| Old agent, 2% risk | $16,943 | +69.4% | 11.0% | 1.264 | 6.3 |
+| Old agent, 3% risk (+25% breaker, never tripped) | $21,418 | +114.2% | 16.1% | 1.251 | 7.1 |
+| Old agent, 4% risk | $26,931 | +169.3% | 21.0% | 1.251 | 8.1 |
+| Retrained 150k (3% risk, dd_penalty=10, breaker 25%) → `model_gold_risk` | $20,753 | +107.5% | 26.3% | 1.383 | 4.1 |
+
+Recommended deployable config: `model_gold_best` replayed with `risk_pct_per_trade=0.03` and `max_dd_pct=0.25`. Return/DD choice is a linear dial via the risk budget. Artifacts: `results_risk_old/`, `results_risk3_old/`, `results_risk4_old/`, `results_risk3_cb/`, `results_risk_train/`.
+
+Verification: same `smoke_env.py` / `webhook_test.py` pass; env import backward-compat verified (default lot path unchanged, `lot_units` now logged per trade).
+
 Verification: `python smoke_env.py` (env sanity) and `python webhook_test.py` (200 posted bars → 119 warmup → 81 live BUY/SELL/HOLD/CLOSE decisions with confidence + value estimates) both pass.
